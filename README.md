@@ -1,4 +1,4 @@
-﻿# MoreInteractions
+# MoreInteractions
 
 Hold `F` to enter free-cursor interaction mode.
 If your in-game `Interact` keybind is remapped, the mod now follows that binding too (when `HoldKey` remains default `F`).
