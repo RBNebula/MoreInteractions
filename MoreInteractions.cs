@@ -241,13 +241,10 @@ internal static class InteractionRaycastService
     }
 }
 
-[BepInPlugin(PluginGuid, PluginName, PluginVersion)]
+[BepInPlugin(ModInfo.PLUGIN_GUID, ModInfo.PLUGIN_NAME, ModInfo.PLUGIN_VERSION)]
+[BepInDependency("modmogul.core")]
 public sealed class MoreInteractions : BaseUnityPlugin
 {
-    public const string PluginGuid = "com.moreinteractions";
-    public const string PluginName = "MoreInteractions";
-    public const string PluginVersion = "0.2.0";
-
     private static readonly FieldInfo? InteractRangeField = AccessTools.Field(typeof(PlayerController), "_interactRange");
 
     private static MoreInteractions? s_instance;
@@ -256,6 +253,7 @@ public sealed class MoreInteractions : BaseUnityPlugin
     private readonly IInteractionInput _input = new UnityInteractionInput();
 
     private Harmony? _harmony;
+    private MoreInteractionsRuntime? _runtime;
     private PlayerController? _player;
 
     private InteractionMode _mode = InteractionMode.Gameplay;
@@ -269,6 +267,8 @@ public sealed class MoreInteractions : BaseUnityPlugin
     private float _focusZoomCurrent;
     private float _focusZoomVelocity;
     private IWorldScreenInteractable? _focusedScreen;
+    private Vector3 _screenOpenCameraLocalPosition;
+    private bool _hasScreenOpenCameraLocalPosition;
 
     private ConfigEntry<bool>? _enabled;
     private ConfigEntry<KeyCode>? _holdKey;
@@ -311,6 +311,7 @@ public sealed class MoreInteractions : BaseUnityPlugin
     {
         s_instance = this;
         s_log = Logger;
+        _runtime = new MoreInteractionsRuntime(Logger);
 
         _enabled = Config.Bind("General", "Enabled", true, "Enable MoreInteractions.");
         _holdKey = Config.Bind("General", "HoldKey", KeyCode.F, "Hold this key to enter free-cursor interaction mode.");
@@ -345,10 +346,21 @@ public sealed class MoreInteractions : BaseUnityPlugin
 
         SanitizeConfigValues();
 
-        _harmony = new Harmony(PluginGuid);
+        _harmony = new Harmony(ModInfo.HARMONY_ID);
         _harmony.PatchAll(typeof(MoreInteractions).Assembly);
 
-        Logger.LogInfo($"{PluginName} {PluginVersion} initialized.");
+        Logger.LogInfo($"{ModInfo.LOG_PREFIX} {ModInfo.PLUGIN_NAME} {ModInfo.PLUGIN_VERSION} initialized.");
+    }
+
+    private async void Start()
+    {
+        if (_runtime == null)
+        {
+            return;
+        }
+
+        await _runtime.InitializeAsync();
+        Logger.LogInfo($"{ModInfo.LOG_PREFIX} Registered Futuristic Screen.");
     }
 
     private void Update()
@@ -409,6 +421,8 @@ public sealed class MoreInteractions : BaseUnityPlugin
     private void OnDestroy()
     {
         ResetToGameplay();
+        _runtime?.Dispose();
+        _runtime = null;
         _harmony?.UnpatchSelf();
         _harmony = null;
 
@@ -508,7 +522,7 @@ public sealed class MoreInteractions : BaseUnityPlugin
 
         if (_player == null)
         {
-            _player = UnityEngine.Object.FindObjectOfType<PlayerController>();
+            _player = UnityEngine.Object.FindFirstObjectByType<PlayerController>();
         }
 
         player = _player;
@@ -583,6 +597,7 @@ public sealed class MoreInteractions : BaseUnityPlugin
         _focusZoomTarget = 0f;
         _focusZoomCurrent = 0f;
         _focusZoomVelocity = 0f;
+        _hasScreenOpenCameraLocalPosition = false;
 
         _yawOffset = 0f;
         _pitchOffset = 0f;
@@ -718,6 +733,7 @@ public sealed class MoreInteractions : BaseUnityPlugin
     private void OpenFocusedScreen(IWorldScreenInteractable screen)
     {
         _focusedScreen = screen;
+        _hasScreenOpenCameraLocalPosition = false;
         ScreenOpened?.Invoke(screen);
         LogDebug(DebugGroup.Focus, $"Opened screen '{screen.ScreenTransform.name}'.");
     }
@@ -733,6 +749,7 @@ public sealed class MoreInteractions : BaseUnityPlugin
         }
 
         _focusZoomTarget = 0f;
+        _hasScreenOpenCameraLocalPosition = false;
         if (!keepHoldMode)
         {
             SetMode(InteractionMode.Gameplay);
@@ -854,6 +871,14 @@ public sealed class MoreInteractions : BaseUnityPlugin
 
         if (instance._mode == InteractionMode.ScreenOpen && instance._focusedScreen != null)
         {
+            if (!instance._hasScreenOpenCameraLocalPosition)
+            {
+                instance._screenOpenCameraLocalPosition = camera.transform.localPosition;
+                instance._hasScreenOpenCameraLocalPosition = true;
+            }
+
+            camera.transform.localPosition = instance._screenOpenCameraLocalPosition;
+
             var zoomSmooth = Mathf.Max(0.001f, instance._screenFocusZoomSmooth?.Value ?? 0.08f);
             instance._focusZoomCurrent = Mathf.SmoothDamp(instance._focusZoomCurrent, instance._focusZoomTarget, ref instance._focusZoomVelocity, zoomSmooth);
 
@@ -869,10 +894,22 @@ public sealed class MoreInteractions : BaseUnityPlugin
                     var desiredRotation = Quaternion.LookRotation(toTarget.normalized, Vector3.up);
                     var lookSmooth = Mathf.Max(0.001f, instance._screenFocusLookSmooth?.Value ?? 0.08f);
                     var lerpT = 1f - Mathf.Exp(-Time.deltaTime / lookSmooth);
-                    camera.transform.rotation = Quaternion.Slerp(camera.transform.rotation, desiredRotation, lerpT * instance._focusZoomCurrent);
+                    ApplyStableFocusRotation(camera.transform, desiredRotation, lerpT * instance._focusZoomCurrent);
                 }
             }
         }
+    }
+
+    private static void ApplyStableFocusRotation(Transform cameraTransform, Quaternion desiredWorldRotation, float interpolation)
+    {
+        if (cameraTransform.parent == null)
+        {
+            cameraTransform.rotation = Quaternion.Slerp(cameraTransform.rotation, desiredWorldRotation, interpolation);
+            return;
+        }
+
+        Quaternion desiredLocalRotation = Quaternion.Inverse(cameraTransform.parent.rotation) * desiredWorldRotation;
+        cameraTransform.localRotation = Quaternion.Slerp(cameraTransform.localRotation, desiredLocalRotation, interpolation);
     }
 
     internal static void ApplyViewModelTwist(PlayerController player)
@@ -920,7 +957,7 @@ public sealed class MoreInteractions : BaseUnityPlugin
 
     internal static void LogError(string context, Exception ex)
     {
-        (s_log ?? BepInEx.Logging.Logger.CreateLogSource(PluginName)).LogError($"{context}: {ex}");
+        (s_log ?? BepInEx.Logging.Logger.CreateLogSource(ModInfo.PLUGIN_NAME)).LogError($"{context}: {ex}");
     }
 }
 
